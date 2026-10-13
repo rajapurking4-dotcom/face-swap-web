@@ -7,8 +7,8 @@ on:
     branches: [ "main" ]
 
 jobs:
-    build:
-      runs-on: ubuntu-latest
+  build:
+    runs-on: ubuntu-latest
     env:
       ANDROID_SDK_ROOT: $ANDROID_SDK_ROOT/android-sdk
 
@@ -22,7 +22,9 @@ jobs:
           distribution: 'temurin'
           java-version: '11'
 
-    - uses: android-actions/setup-android@v4
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v4
+
       - name: Cache Gradle
         uses: actions/cache@v4
         with:
@@ -47,3 +49,4 @@ jobs:
         with:
           name: app-debug-apk
           path: app/build/outputs/apk/debug/*.apk
+          
