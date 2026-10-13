@@ -51,22 +51,28 @@ class FaceSwapProcessor(private val context: Context) {
                     for (p in c.points) contourPts.add(PointF(p.x, p.y))
                 }
             }
+            // Fixed order + fixed point count per contour => source/target points correspond 1-to-1.
             addContour(f.getContour(FaceContour.FACE))
             addContour(f.getContour(FaceContour.LEFT_EYEBROW_TOP))
+            addContour(f.getContour(FaceContour.LEFT_EYEBROW_BOTTOM))
             addContour(f.getContour(FaceContour.LEFT_EYE))
             addContour(f.getContour(FaceContour.RIGHT_EYEBROW_TOP))
+            addContour(f.getContour(FaceContour.RIGHT_EYEBROW_BOTTOM))
             addContour(f.getContour(FaceContour.RIGHT_EYE))
-            addContour(f.getContour(FaceContour.UPPER_LIP_TOP))
-            addContour(f.getContour(FaceContour.LOWER_LIP_BOTTOM))
+            addContour(f.getContour(FaceContour.NOSE_BRIDGE))
             addContour(f.getContour(FaceContour.NOSE_BOTTOM))
+            addContour(f.getContour(FaceContour.UPPER_LIP_TOP))
+            addContour(f.getContour(FaceContour.UPPER_LIP_BOTTOM))
+            addContour(f.getContour(FaceContour.LOWER_LIP_TOP))
+            addContour(f.getContour(FaceContour.LOWER_LIP_BOTTOM))
+            addContour(f.getContour(FaceContour.LEFT_CHEEK))
+            addContour(f.getContour(FaceContour.RIGHT_CHEEK))
             if (contourPts.isEmpty()) {
                 contourPts.add(PointF(bbox.left.toFloat(), bbox.top.toFloat()))
                 contourPts.add(PointF(bbox.right.toFloat(), bbox.top.toFloat()))
                 contourPts.add(PointF(bbox.right.toFloat(), bbox.bottom.toFloat()))
                 contourPts.add(PointF(bbox.left.toFloat(), bbox.bottom.toFloat()))
             }
-            // Keep the raw ML Kit contour points: each contour type has a fixed number of
-            // points in a fixed order, so source and target points correspond 1-to-1.
             out.add(FaceInfo(idx, bbox, lands, contourPts))
         }
         return out
@@ -225,22 +231,55 @@ class FaceSwapProcessor(private val context: Context) {
         return warped
     }
 
+    /** Gaussian blur that only averages over pixels inside the mask (normalized convolution). */
+    private fun maskedBlur(ch: Mat, maskF: Mat, maskBlur: Mat, sigma: Double): Mat {
+        val prod = Mat()
+        Core.multiply(ch, maskF, prod)
+        val blurred = Mat()
+        Imgproc.GaussianBlur(prod, blurred, Size(0.0, 0.0), sigma)
+        val out = Mat()
+        Core.divide(blurred, maskBlur, out)
+        return out
+    }
+
+    private fun blurredMask(maskF: Mat, sigma: Double): Mat {
+        val mb = Mat()
+        Imgproc.GaussianBlur(maskF, mb, Size(0.0, 0.0), sigma)
+        Core.max(mb, Scalar(1e-3), mb)
+        return mb
+    }
+
     /**
-     * Matches the warped source face to the target's skin tone / lighting (Reinhard color
-     * transfer in LAB space, measured only inside the face), then blends it in with a
-     * feathered (soft-edged) mask. All Mats are 3-channel 8-bit RGB.
+     * Blends the warped source face into the target using frequency separation in LAB:
+     *  - fine detail (eyes, lips, nose shape) comes from the source face
+     *  - overall lighting, shadows and skin color (low frequencies) come from the target
+     * This removes the source's dark eye circles / shadows and any skin-tone mismatch.
+     * Works only on a crop around the face. All Mats are 3-channel 8-bit RGB.
      */
-    private fun blendWithColorTransfer(warpedSrc: Mat, tgtMat: Mat, faceMask: Mat, faceWidth: Int): Mat {
+    private fun blendWithColorTransfer(warpedSrc: Mat, tgtMat: Mat, faceMask: Mat, faceRect: Rect): Mat {
+        val pad = (faceRect.width * 0.15).toInt()
+        val x0 = maxOf(0, faceRect.x - pad)
+        val y0 = maxOf(0, faceRect.y - pad)
+        val x1 = min(tgtMat.cols(), faceRect.x + faceRect.width + pad)
+        val y1 = min(tgtMat.rows(), faceRect.y + faceRect.height + pad)
+        val roi = Rect(x0, y0, x1 - x0, y1 - y0)
+        if (roi.width <= 4 || roi.height <= 4) return tgtMat.clone()
+
+        val src = Mat(warpedSrc, roi)
+        val tgt = Mat(tgtMat, roi)
+        val msk = Mat(faceMask, roi)
+        val faceWidth = faceRect.width
+
         // Where the warped source really has pixels (triangles can leave tiny gaps).
         val gray = Mat()
-        Imgproc.cvtColor(warpedSrc, gray, Imgproc.COLOR_RGB2GRAY)
+        Imgproc.cvtColor(src, gray, Imgproc.COLOR_RGB2GRAY)
         val nonBlack = Mat()
         Imgproc.threshold(gray, nonBlack, 0.0, 255.0, Imgproc.THRESH_BINARY)
         val valid = Mat()
-        Core.bitwise_and(nonBlack, faceMask, valid)
+        Core.bitwise_and(nonBlack, msk, valid)
         val closeK = Imgproc.getStructuringElement(Imgproc.MORPH_ELLIPSE, Size(5.0, 5.0))
         Imgproc.morphologyEx(valid, valid, Imgproc.MORPH_CLOSE, closeK)
-        Core.bitwise_and(valid, faceMask, valid)
+        Core.bitwise_and(valid, msk, valid)
 
         // Shrink a little so the blend stays inside the face (away from hair/background).
         val er = maxOf(2, (faceWidth * 0.03).toInt())
@@ -248,36 +287,48 @@ class FaceSwapProcessor(private val context: Context) {
         val inner = Mat()
         Imgproc.erode(valid, inner, erodeK)
         val region = if (Core.countNonZero(inner) >= 100) inner else valid
+        if (Core.countNonZero(region) < 100) return tgtMat.clone()
 
-        var corrected = warpedSrc
-        if (Core.countNonZero(region) >= 100) {
-            val srcLab = Mat()
-            Imgproc.cvtColor(warpedSrc, srcLab, Imgproc.COLOR_RGB2Lab)
-            val tgtLab = Mat()
-            Imgproc.cvtColor(tgtMat, tgtLab, Imgproc.COLOR_RGB2Lab)
+        // ---- Frequency separation in LAB ----
+        val srcLab8 = Mat()
+        Imgproc.cvtColor(src, srcLab8, Imgproc.COLOR_RGB2Lab)
+        val tgtLab8 = Mat()
+        Imgproc.cvtColor(tgt, tgtLab8, Imgproc.COLOR_RGB2Lab)
+        val sCh = ArrayList<Mat>()
+        Core.split(srcLab8, sCh)
+        val tCh = ArrayList<Mat>()
+        Core.split(tgtLab8, tCh)
 
-            val sMean = MatOfDouble(); val sStd = MatOfDouble()
-            val tMean = MatOfDouble(); val tStd = MatOfDouble()
-            Core.meanStdDev(srcLab, sMean, sStd, region)
-            Core.meanStdDev(tgtLab, tMean, tStd, region)
-            val sm = sMean.toArray(); val ss = sStd.toArray()
-            val tm = tMean.toArray(); val ts = tStd.toArray()
+        val maskF = Mat()
+        region.convertTo(maskF, CvType.CV_32F, 1.0 / 255.0)
+        val sigmaL = maxOf(2.0, faceWidth * 0.14)   // lightness: keeps eye/lip/nose structure
+        val sigmaC = maxOf(3.0, faceWidth * 0.30)   // color: almost fully from the target skin
+        val maskBlurL = blurredMask(maskF, sigmaL)
+        val maskBlurC = blurredMask(maskF, sigmaC)
 
-            val chans = ArrayList<Mat>()
-            Core.split(srcLab, chans)
-            for (c in 0..2) {
-                val scale = (ts[c] / maxOf(ss[c], 1.0)).coerceIn(0.7, 1.4)
-                val shift = tm[c] - sm[c] * scale
-                chans[c].convertTo(chans[c], CvType.CV_8U, scale, shift)
-            }
-            val labAdj = Mat()
-            Core.merge(chans, labAdj)
-            val rgbAdj = Mat()
-            Imgproc.cvtColor(labAdj, rgbAdj, Imgproc.COLOR_Lab2RGB)
-            corrected = rgbAdj
+        val outCh = ArrayList<Mat>()
+        for (c in 0..2) {
+            val sigma = if (c == 0) sigmaL else sigmaC
+            val mb = if (c == 0) maskBlurL else maskBlurC
+            val sF = Mat()
+            sCh[c].convertTo(sF, CvType.CV_32F)
+            val tF = Mat()
+            tCh[c].convertTo(tF, CvType.CV_32F)
+            val sLow = maskedBlur(sF, maskF, mb, sigma)
+            val tLow = maskedBlur(tF, maskF, mb, sigma)
+            val res = Mat()
+            Core.subtract(sF, sLow, res)      // source detail
+            Core.add(res, tLow, res)          // + target lighting/color
+            val res8 = Mat()
+            res.convertTo(res8, CvType.CV_8U) // saturates to 0..255
+            outCh.add(res8)
         }
+        val labOut = Mat()
+        Core.merge(outCh, labOut)
+        val corrected = Mat()
+        Imgproc.cvtColor(labOut, corrected, Imgproc.COLOR_Lab2RGB)
 
-        // Feathered alpha mask.
+        // ---- Feathered alpha blend ----
         var featherK = (faceWidth * 0.08).toInt()
         if (featherK % 2 == 0) featherK += 1
         if (featherK < 5) featherK = 5
@@ -291,7 +342,7 @@ class FaceSwapProcessor(private val context: Context) {
         val srcF = Mat()
         corrected.convertTo(srcF, CvType.CV_32FC3)
         val tgtF = Mat()
-        tgtMat.convertTo(tgtF, CvType.CV_32FC3)
+        tgt.convertTo(tgtF, CvType.CV_32FC3)
         val ones = Mat(alpha3.size(), CvType.CV_32FC3, Scalar(1.0, 1.0, 1.0))
         val invAlpha = Mat()
         Core.subtract(ones, alpha3, invAlpha)
@@ -301,9 +352,13 @@ class FaceSwapProcessor(private val context: Context) {
         Core.multiply(tgtF, invAlpha, bg)
         val outF = Mat()
         Core.add(fg, bg, outF)
-        val out = Mat()
-        outF.convertTo(out, CvType.CV_8UC3)
-        return out
+        val blended = Mat()
+        outF.convertTo(blended, CvType.CV_8UC3)
+
+        // Put the blended crop back into a copy of the full target image.
+        val result = tgtMat.clone()
+        blended.copyTo(Mat(result, roi))
+        return result
     }
 
     private fun applyDelaunayWarpAndBlend(srcMat: Mat, srcFaceInfo: FaceInfo, tgtMat: Mat, tgtFaceInfo: FaceInfo): Mat {
@@ -341,7 +396,7 @@ class FaceSwapProcessor(private val context: Context) {
         }
 
         return try {
-            blendWithColorTransfer(warpedSrc, tgtMat, mask, maskRect.width)
+            blendWithColorTransfer(warpedSrc, tgtMat, mask, maskRect)
         } catch (e: Exception) {
             tgtMat.clone()
         }
@@ -369,7 +424,7 @@ class FaceSwapProcessor(private val context: Context) {
             return null
         }
 
-        // Convert to 3-channel RGB: the warp/blend code (masks, color transfer) needs 3 channels.
+        // Convert to 3-channel RGB: the warp/blend code (masks, color work) needs 3 channels.
         val tgtMat = rgbaToRgb(OpenCVUtils.bitmapToMat(targetBitmap))
         val srcMat = rgbaToRgb(OpenCVUtils.bitmapToMat(sourceBitmap))
 
