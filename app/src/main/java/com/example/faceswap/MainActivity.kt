@@ -292,73 +292,74 @@ fun ImageWithFaceOverlay(
         .height(boxSize)
         .background(Color.Black, RoundedCornerShape(6.dp)),
         contentAlignment = Alignment.Center) {
+        // NOTE: no early `return` here - early returns inside composables can corrupt
+        // Compose's slot table on older compiler versions and crash at launch.
         if (bitmap == null) {
             Text(label, color = Color.Gray)
-            return@Box
-        }
+        } else {
+            var layoutSize by remember { mutableStateOf(IntSize(1, 1)) }
 
-        var layoutSize by remember { mutableStateOf(IntSize(1, 1)) }
+            Box(modifier = Modifier
+                .fillMaxSize()
+                .onGloballyPositioned { coords ->
+                    layoutSize = coords.size
+                }
+                .pointerInput(faces, bitmap, layoutSize) {
+                    detectTapGestures { offset ->
+                        val imgW = bitmap.width.toFloat()
+                        val imgH = bitmap.height.toFloat()
+                        val layoutW = layoutSize.width.toFloat().coerceAtLeast(1f)
+                        val layoutH = layoutSize.height.toFloat().coerceAtLeast(1f)
 
-        Box(modifier = Modifier
-            .fillMaxSize()
-            .onGloballyPositioned { coords ->
-                layoutSize = coords.size
-            }
-            .pointerInput(faces, bitmap, layoutSize) {
-                detectTapGestures { offset ->
+                        val scale = min(layoutW / imgW, layoutH / imgH)
+                        val displayedW = imgW * scale
+                        val displayedH = imgH * scale
+                        val left = (layoutW - displayedW) / 2f
+                        val top = (layoutH - displayedH) / 2f
+
+                        val xImg = ((offset.x - left) / displayedW) * imgW
+                        val yImg = ((offset.y - top) / displayedH) * imgH
+
+                        for (f in faces) {
+                            val r = f.boundingBox
+                            if (xImg >= r.left && xImg <= r.right && yImg >= r.top && yImg <= r.bottom) {
+                                onFaceTap(f.id)
+                                break
+                            }
+                        }
+                    }
+                }
+            ) {
+                Canvas(modifier = Modifier.fillMaxSize()) {
                     val imgW = bitmap.width.toFloat()
                     val imgH = bitmap.height.toFloat()
-                    val layoutW = layoutSize.width.toFloat().coerceAtLeast(1f)
-                    val layoutH = layoutSize.height.toFloat().coerceAtLeast(1f)
-
+                    val layoutW = size.width
+                    val layoutH = size.height
                     val scale = min(layoutW / imgW, layoutH / imgH)
                     val displayedW = imgW * scale
                     val displayedH = imgH * scale
                     val left = (layoutW - displayedW) / 2f
                     val top = (layoutH - displayedH) / 2f
 
-                    val xImg = ((offset.x - left) / displayedW) * imgW
-                    val yImg = ((offset.y - top) / displayedH) * imgH
+                    drawIntoCanvas { canvas ->
+                        canvas.nativeCanvas.drawBitmap(bitmap, null, android.graphics.RectF(left, top, left + displayedW, top + displayedH), null)
+                    }
 
                     for (f in faces) {
-                        val r = f.boundingBox
-                        if (xImg >= r.left && xImg <= r.right && yImg >= r.top && yImg <= r.bottom) {
-                            onFaceTap(f.id)
-                            break
-                        }
+                        val rect = f.boundingBox
+                        val l = left + (rect.left.toFloat() / imgW) * displayedW
+                        val t = top + (rect.top.toFloat() / imgH) * displayedH
+                        val r = left + (rect.right.toFloat() / imgW) * displayedW
+                        val b = top + (rect.bottom.toFloat() / imgH) * displayedH
+                        val isSelected = selectedFaces.contains(f.id)
+                        val strokeColor = if (isSelected) Color.Red else Color.White.copy(alpha = 0.6f)
+                        drawRect(
+                            color = strokeColor,
+                            topLeft = Offset(l, t),
+                            size = androidx.compose.ui.geometry.Size(r - l, b - t),
+                            style = Stroke(width = if (isSelected) 3f else 2f)
+                        )
                     }
-                }
-            }
-        ) {
-            Canvas(modifier = Modifier.fillMaxSize()) {
-                val imgW = bitmap.width.toFloat()
-                val imgH = bitmap.height.toFloat()
-                val layoutW = size.width
-                val layoutH = size.height
-                val scale = min(layoutW / imgW, layoutH / imgH)
-                val displayedW = imgW * scale
-                val displayedH = imgH * scale
-                val left = (layoutW - displayedW) / 2f
-                val top = (layoutH - displayedH) / 2f
-
-                drawIntoCanvas { canvas ->
-                    canvas.nativeCanvas.drawBitmap(bitmap, null, android.graphics.RectF(left, top, left + displayedW, top + displayedH), null)
-                }
-
-                for (f in faces) {
-                    val rect = f.boundingBox
-                    val l = left + (rect.left.toFloat() / imgW) * displayedW
-                    val t = top + (rect.top.toFloat() / imgH) * displayedH
-                    val r = left + (rect.right.toFloat() / imgW) * displayedW
-                    val b = top + (rect.bottom.toFloat() / imgH) * displayedH
-                    val isSelected = selectedFaces.contains(f.id)
-                    val strokeColor = if (isSelected) Color.Red else Color.White.copy(alpha = 0.6f)
-                    drawRect(
-                        color = strokeColor,
-                        topLeft = Offset(l, t),
-                        size = androidx.compose.ui.geometry.Size(r - l, b - t),
-                        style = Stroke(width = if (isSelected) 3f else 2f)
-                    )
                 }
             }
         }
