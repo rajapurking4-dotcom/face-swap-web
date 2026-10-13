@@ -1,9 +1,13 @@
 package com.example.faceswap.processing
 
+import android.content.ContentValues
 import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.net.Uri
+import android.os.Build
+import android.os.Environment
+import android.provider.MediaStore
 import com.arthenica.ffmpegkit.FFmpegKit
 import com.arthenica.ffmpegkit.ReturnCode
 import kotlinx.coroutines.Dispatchers
@@ -15,6 +19,7 @@ import java.io.File
  * 1. Extracting frames from the input video with FFmpegKit.
  * 2. Running the existing FaceSwapProcessor on each frame.
  * 3. Re-encoding the processed frames back into a video with FFmpegKit.
+ * 4. Saving the finished video to the Gallery (Movies/FaceSwap).
  *
  * This is a straightforward frame-by-frame pipeline; it trades some speed
  * for simplicity and reliability.
@@ -38,14 +43,20 @@ class VideoProcessor(private val context: Context) {
         outFramesDir.mkdirs()
 
         try {
-            val inputVideoFile = copyUriToFile(videoUri, File(workDir, "input.mp4")) ?: return@withContext null
+            onProgress("Copying video...", 0.02f)
+            val inputVideoFile = copyUriToFile(videoUri, File(workDir, "input.mp4"))
+            if (inputVideoFile == null) {
+                onProgress("Could not read the selected video", 0f)
+                return@withContext null
+            }
 
             onProgress("Extracting frames...", 0.05f)
-            val fps = 24
-            val extractCmd = "-i \"${inputVideoFile.absolutePath}\" -vf fps=$fps \"${framesDir.absolutePath}/frame_%05d.png\""
+            // 15 fps and max 720px wide keeps this feasible on a phone.
+            val fps = 15
+            val extractCmd = "-y -i \"${inputVideoFile.absolutePath}\" -vf \"fps=$fps,scale=720:-2\" \"${framesDir.absolutePath}/frame_%05d.png\""
             val extractSession = FFmpegKit.execute(extractCmd)
             if (!ReturnCode.isSuccess(extractSession.returnCode)) {
-                onProgress("Frame extraction failed", 0f)
+                onProgress("Frame extraction failed: ${logTail(extractSession.allLogsAsString)}", 0f)
                 return@withContext null
             }
 
@@ -62,12 +73,16 @@ class VideoProcessor(private val context: Context) {
                     val targetFaces = faceSwapProcessor.detectFaces(bmp)
                     val matchingTargetIds = targetFaces.map { it.id }
                     val swapped = if (matchingTargetIds.isNotEmpty()) {
-                        faceSwapProcessor.swapFacesWithDelaunay(
-                            sourceBitmap,
-                            sourceFaceId,
-                            bmp,
-                            matchingTargetIds
-                        ) { _, _ -> }
+                        try {
+                            faceSwapProcessor.swapFacesWithDelaunay(
+                                sourceBitmap,
+                                sourceFaceId,
+                                bmp,
+                                matchingTargetIds
+                            ) { _, _ -> }
+                        } catch (e: Exception) {
+                            null
+                        }
                     } else {
                         null
                     }
@@ -83,18 +98,51 @@ class VideoProcessor(private val context: Context) {
 
             onProgress("Re-encoding video...", 0.92f)
             val outputFile = File(workDir, "output.mp4")
-            val encodeCmd = "-framerate $fps -i \"${outFramesDir.absolutePath}/frame_%05d.png\" -i \"${inputVideoFile.absolutePath}\" -map 0:v -map 1:a? -c:v libx264 -pix_fmt yuv420p -c:a copy -shortest \"${outputFile.absolutePath}\""
+            // mpeg4 is built into FFmpeg (libx264 is NOT in this FFmpegKit package).
+            val encodeCmd = "-y -framerate $fps -i \"${outFramesDir.absolutePath}/frame_%05d.png\" -i \"${inputVideoFile.absolutePath}\" -map 0:v -map 1:a? -c:v mpeg4 -q:v 3 -pix_fmt yuv420p -c:a aac -shortest \"${outputFile.absolutePath}\""
             val encodeSession = FFmpegKit.execute(encodeCmd)
             if (!ReturnCode.isSuccess(encodeSession.returnCode)) {
-                onProgress("Video encoding failed", 0f)
+                onProgress("Video encoding failed: ${logTail(encodeSession.allLogsAsString)}", 0f)
                 return@withContext null
             }
 
-            onProgress("Done", 1f)
+            val saved = saveToGallery(outputFile)
+            onProgress(if (saved) "Done - saved to Gallery (Movies/FaceSwap)" else "Done (could not copy to Gallery)", 1f)
             outputFile
         } catch (e: Exception) {
             onProgress("Error: ${e.message}", 0f)
             null
+        }
+    }
+
+    private fun logTail(logs: String?): String {
+        if (logs.isNullOrBlank()) return ""
+        return logs.trim().takeLast(200)
+    }
+
+    private fun saveToGallery(file: File): Boolean {
+        return try {
+            val name = "FaceSwap_${System.currentTimeMillis()}.mp4"
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                val values = ContentValues().apply {
+                    put(MediaStore.Video.Media.DISPLAY_NAME, name)
+                    put(MediaStore.Video.Media.MIME_TYPE, "video/mp4")
+                    put(MediaStore.Video.Media.RELATIVE_PATH, Environment.DIRECTORY_MOVIES + "/FaceSwap")
+                }
+                val uri = context.contentResolver.insert(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, values)
+                    ?: return false
+                context.contentResolver.openOutputStream(uri)?.use { out ->
+                    file.inputStream().use { it.copyTo(out) }
+                }
+                true
+            } else {
+                val dir = context.getExternalFilesDir(Environment.DIRECTORY_MOVIES) ?: return false
+                dir.mkdirs()
+                file.copyTo(File(dir, name), overwrite = true)
+                true
+            }
+        } catch (e: Exception) {
+            false
         }
     }
 
@@ -104,7 +152,7 @@ class VideoProcessor(private val context: Context) {
                 destFile.outputStream().use { output ->
                     input.copyTo(output)
                 }
-            }
+            } ?: return null
             destFile
         } catch (e: Exception) {
             null
