@@ -65,8 +65,9 @@ class FaceSwapProcessor(private val context: Context) {
                 contourPts.add(PointF(bbox.right.toFloat(), bbox.bottom.toFloat()))
                 contourPts.add(PointF(bbox.left.toFloat(), bbox.bottom.toFloat()))
             }
-            val resampled = resampleContour(contourPts, samplingPoints)
-            out.add(FaceInfo(idx, bbox, lands, resampled))
+            // Keep the raw ML Kit contour points: each contour type has a fixed number of
+            // points in a fixed order, so source and target points correspond 1-to-1.
+            out.add(FaceInfo(idx, bbox, lands, contourPts))
         }
         return out
     }
@@ -225,15 +226,31 @@ class FaceSwapProcessor(private val context: Context) {
     }
 
     private fun applyDelaunayWarpAndBlend(srcMat: Mat, srcFaceInfo: FaceInfo, tgtMat: Mat, tgtFaceInfo: FaceInfo): Mat {
-        val srcPts = toCvPoints(srcFaceInfo.contourPoints)
-        val tgtPts = toCvPoints(tgtFaceInfo.contourPoints)
+        var srcPts = toCvPoints(srcFaceInfo.contourPoints)
+        var tgtPts = toCvPoints(tgtFaceInfo.contourPoints)
+        if (srcPts.size != tgtPts.size) {
+            // Some contour was missing on one face: fall back to equal-size resampling.
+            srcPts = toCvPoints(resampleContour(srcFaceInfo.contourPoints, 100))
+            tgtPts = toCvPoints(resampleContour(tgtFaceInfo.contourPoints, 100))
+        }
+        // Keep all points inside their images (Subdiv2D requires this).
+        val tMaxX = tgtMat.cols() - 1.0
+        val tMaxY = tgtMat.rows() - 1.0
+        val sMaxX = srcMat.cols() - 1.0
+        val sMaxY = srcMat.rows() - 1.0
+        tgtPts = tgtPts.map { Point(it.x.coerceIn(0.0, tMaxX), it.y.coerceIn(0.0, tMaxY)) }
+        srcPts = srcPts.map { Point(it.x.coerceIn(0.0, sMaxX), it.y.coerceIn(0.0, sMaxY)) }
+
         val warpedSrc = warpWithDelaunay(srcMat, srcPts, tgtPts, Size(tgtMat.cols().toDouble(), tgtMat.rows().toDouble()))
 
+        // Proper convex hull of the target face points as the blend mask.
         val mask = Mat.zeros(tgtMat.rows(), tgtMat.cols(), CvType.CV_8UC1)
-        val hullPts = tgtPts.toTypedArray()
-        val hullMat = MatOfPoint(*hullPts)
         try {
-            Imgproc.fillConvexPoly(mask, hullMat, Scalar(255.0))
+            val allPts = MatOfPoint(*tgtPts.toTypedArray())
+            val hullIdx = MatOfInt()
+            Imgproc.convexHull(allPts, hullIdx)
+            val hullPts = hullIdx.toArray().map { tgtPts[it] }
+            Imgproc.fillConvexPoly(mask, MatOfPoint(*hullPts.toTypedArray()), Scalar(255.0))
         } catch (ex: Exception) {
             Imgproc.rectangle(mask, Point(0.0, 0.0), Point(tgtMat.cols().toDouble(), tgtMat.rows().toDouble()), Scalar(255.0))
         }
