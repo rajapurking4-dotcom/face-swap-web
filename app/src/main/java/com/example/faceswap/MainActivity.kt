@@ -1,8 +1,13 @@
 package com.example.faceswap
 
+import android.content.ContentValues
+import android.content.Intent
 import android.graphics.Bitmap
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
+import android.os.Environment
+import android.provider.MediaStore
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
@@ -52,6 +57,41 @@ class MainActivity : ComponentActivity() {
         onVideoPicked(uri)
     }
 
+    /** Saves the bitmap to Gallery (Pictures/FaceSwap) and returns its Uri, or null on failure. */
+    private fun saveBitmapToGallery(bmp: Bitmap): Uri? {
+        return try {
+            val name = "FaceSwap_${System.currentTimeMillis()}.jpg"
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                val values = ContentValues().apply {
+                    put(MediaStore.Images.Media.DISPLAY_NAME, name)
+                    put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg")
+                    put(MediaStore.Images.Media.RELATIVE_PATH, Environment.DIRECTORY_PICTURES + "/FaceSwap")
+                }
+                val uri = contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)
+                    ?: return null
+                contentResolver.openOutputStream(uri)?.use { out ->
+                    bmp.compress(Bitmap.CompressFormat.JPEG, 95, out)
+                }
+                uri
+            } else {
+                @Suppress("DEPRECATION")
+                val path = MediaStore.Images.Media.insertImage(contentResolver, bmp, name, "FaceSwap")
+                if (path != null) Uri.parse(path) else null
+            }
+        } catch (e: Exception) {
+            null
+        }
+    }
+
+    private fun shareImage(uri: Uri) {
+        val intent = Intent(Intent.ACTION_SEND).apply {
+            type = "image/jpeg"
+            putExtra(Intent.EXTRA_STREAM, uri)
+            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        }
+        startActivity(Intent.createChooser(intent, "Share"))
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         OpenCVUtils.initOpenCV(this)
@@ -73,6 +113,7 @@ class MainActivity : ComponentActivity() {
                 var progress by remember { mutableStateOf(0f) }
                 var busy by remember { mutableStateOf(false) }
                 var resultBitmap by remember { mutableStateOf<Bitmap?>(null) }
+                var savedUri by remember { mutableStateOf<Uri?>(null) }
 
                 var videoUri by remember { mutableStateOf<Uri?>(null) }
                 var videoStatus by remember { mutableStateOf("No video selected") }
@@ -105,6 +146,7 @@ class MainActivity : ComponentActivity() {
                                     }
                                 }
                                 resultBitmap = null
+                                savedUri = null
                             }
                         }
                     }
@@ -153,7 +195,8 @@ class MainActivity : ComponentActivity() {
                                         }
                                         if (res != null) {
                                             resultBitmap = res
-                                            status = "Swap complete"
+                                            savedUri = null
+                                            status = "Swap complete - tap Save to store it in Gallery"
                                         } else {
                                             status = "Swap failed or cancelled"
                                         }
@@ -213,8 +256,34 @@ class MainActivity : ComponentActivity() {
                         Spacer(modifier = Modifier.height(12.dp))
 
                         Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceEvenly) {
-                            Button(onClick = { status = "Save not implemented yet" }) { Text("Save", color = Color.White) }
-                            Button(onClick = { status = "Share not implemented yet" }) { Text("Share", color = Color.White) }
+                            Button(onClick = {
+                                val bmp = resultBitmap
+                                if (bmp == null) {
+                                    status = "Nothing to save yet - do a Swap first"
+                                } else {
+                                    val uri = savedUri ?: saveBitmapToGallery(bmp)
+                                    if (uri != null) {
+                                        savedUri = uri
+                                        status = "Saved to Gallery (Pictures/FaceSwap)"
+                                    } else {
+                                        status = "Could not save the image"
+                                    }
+                                }
+                            }) { Text("Save", color = Color.White) }
+                            Button(onClick = {
+                                val bmp = resultBitmap
+                                if (bmp == null) {
+                                    status = "Nothing to share yet - do a Swap first"
+                                } else {
+                                    val uri = savedUri ?: saveBitmapToGallery(bmp)
+                                    if (uri != null) {
+                                        savedUri = uri
+                                        shareImage(uri)
+                                    } else {
+                                        status = "Could not prepare the image for sharing"
+                                    }
+                                }
+                            }) { Text("Share", color = Color.White) }
                         }
 
                         Spacer(modifier = Modifier.height(24.dp))
@@ -245,8 +314,6 @@ class MainActivity : ComponentActivity() {
                                         }
                                         if (outFile != null) {
                                             outputVideoPath = outFile.absolutePath
-                                        } else if (!videoStatus.startsWith("Video") && !videoStatus.startsWith("Frame") && !videoStatus.startsWith("Error") && !videoStatus.startsWith("Could not") && !videoStatus.startsWith("No frames")) {
-                                            videoStatus = "Video swap failed"
                                         }
                                         videoBusy = false
                                     }
