@@ -245,18 +245,23 @@ class FaceSwapProcessor(private val context: Context) {
 
         // Proper convex hull of the target face points as the blend mask.
         val mask = Mat.zeros(tgtMat.rows(), tgtMat.cols(), CvType.CV_8UC1)
+        var maskRect = Rect(0, 0, tgtMat.cols(), tgtMat.rows())
         try {
             val allPts = MatOfPoint(*tgtPts.toTypedArray())
             val hullIdx = MatOfInt()
             Imgproc.convexHull(allPts, hullIdx)
             val hullPts = hullIdx.toArray().map { tgtPts[it] }
-            Imgproc.fillConvexPoly(mask, MatOfPoint(*hullPts.toTypedArray()), Scalar(255.0))
+            val hullMat = MatOfPoint(*hullPts.toTypedArray())
+            Imgproc.fillConvexPoly(mask, hullMat, Scalar(255.0))
+            maskRect = Imgproc.boundingRect(hullMat)
         } catch (ex: Exception) {
             Imgproc.rectangle(mask, Point(0.0, 0.0), Point(tgtMat.cols().toDouble(), tgtMat.rows().toDouble()), Scalar(255.0))
+            maskRect = Rect(0, 0, tgtMat.cols(), tgtMat.rows())
         }
 
-        val rect = tgtFaceInfo.boundingBox
-        val center = Point(rect.exactCenterX().toDouble(), rect.exactCenterY().toDouble())
+        // seamlessClone places the center of the mask's bounding rect at this point,
+        // so it must be the center of the mask rect (NOT the face bounding box).
+        val center = Point(maskRect.x + maskRect.width / 2.0, maskRect.y + maskRect.height / 2.0)
 
         val output = Mat()
         try {
