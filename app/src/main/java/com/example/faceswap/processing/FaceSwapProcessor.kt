@@ -117,7 +117,7 @@ class FaceSwapProcessor(private val context: Context) {
         val subdiv = Subdiv2D(Rect(0, 0, w, h))
         for (p in tgtPts) subdiv.insert(p)
 
-        val tMat = MatOfFloat()
+        val tMat = MatOfFloat6()
         subdiv.getTriangleList(tMat)
         val tArr = tMat.toArray()
 
