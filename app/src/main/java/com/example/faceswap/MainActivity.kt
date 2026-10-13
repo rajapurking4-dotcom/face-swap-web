@@ -1,0 +1,279 @@
+package com.example.faceswap
+
+import android.graphics.Bitmap
+import android.net.Uri
+import android.os.Bundle
+import androidx.activity.ComponentActivity
+import androidx.activity.compose.setContent
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.background
+import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material.*
+import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.graphics.drawscope.drawIntoCanvas
+import androidx.compose.ui.graphics.nativeCanvas
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.layout.onGloballyPositioned
+import androidx.compose.ui.unit.IntSize
+import androidx.compose.ui.unit.dp
+import com.example.faceswap.processing.FaceInfo
+import com.example.faceswap.processing.FaceSwapProcessor
+import com.example.faceswap.processing.OpenCVUtils
+import kotlinx.coroutines.launch
+import kotlin.math.min
+
+class MainActivity : ComponentActivity() {
+
+    private val faceSwapProcessor by lazy { FaceSwapProcessor(this) }
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        OpenCVUtils.initOpenCV(this)
+
+        setContent {
+            MaterialTheme {
+                val scope = rememberCoroutineScope()
+
+                var sourceBitmap by remember { mutableStateOf<Bitmap?>(null) }
+                var targetBitmap by remember { mutableStateOf<Bitmap?>(null) }
+
+                var sourceFaces by remember { mutableStateOf<List<FaceInfo>>(emptyList()) }
+                var targetFaces by remember { mutableStateOf<List<FaceInfo>>(emptyList()) }
+
+                var selectedSourceIndex by remember { mutableStateOf<Int?>(null) }
+                var selectedTargetIndices by remember { mutableStateOf(mutableSetOf<Int>()) }
+
+                var status by remember { mutableStateOf("Idle") }
+                var progress by remember { mutableStateOf(0f) }
+                var busy by remember { mutableStateOf(false) }
+                var resultBitmap by remember { mutableStateOf<Bitmap?>(null) }
+
+                val pickImage = registerForActivityResult(ActivityResultContracts.GetContent()) { uri: Uri? ->
+                    uri?.let { u ->
+                        contentResolver.openInputStream(u)?.use { stream ->
+                            val bmp = android.graphics.BitmapFactory.decodeStream(stream)
+                            if (bmp != null) {
+                                if (sourceBitmap == null) {
+                                    sourceBitmap = bmp
+                                    scope.launch {
+                                        status = "Detecting faces in source..."
+                                        sourceFaces = faceSwapProcessor.detectFaces(bmp)
+                                        selectedSourceIndex = sourceFaces.firstOrNull()?.id
+                                        status = "Found ${sourceFaces.size} face(s) in source"
+                                    }
+                                } else {
+                                    targetBitmap = bmp
+                                    scope.launch {
+                                        status = "Detecting faces in target..."
+                                        targetFaces = faceSwapProcessor.detectFaces(bmp)
+                                        selectedTargetIndices = mutableSetOf<Int>().apply {
+                                            targetFaces.forEach { add(it.id) }
+                                        }
+                                        status = "Found ${targetFaces.size} face(s) in target"
+                                    }
+                                }
+                                resultBitmap = null
+                            }
+                        }
+                    }
+                }
+
+                Scaffold(
+                    topBar = {
+                        TopAppBar(
+                            title = { Text("FaceSwap", color = Color.Red) },
+                            backgroundColor = Color.Black
+                        )
+                    },
+                    backgroundColor = Color.Black
+                ) { padding ->
+                    Column(modifier = Modifier
+                        .padding(padding)
+                        .fillMaxSize()
+                        .background(Color.Black)
+                        .padding(12.dp)) {
+
+                        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                            Button(onClick = { pickImage.launch("image/*") }) { Text("Pick Source/Target") }
+                            Button(onClick = {
+                                if (sourceBitmap != null && targetBitmap != null && selectedSourceIndex != null && selectedTargetIndices.isNotEmpty()) {
+                                    scope.launch {
+                                        busy = true
+                                        status = "Starting swap..."
+                                        progress = 0f
+                                        val res = faceSwapProcessor.swapFacesWithDelaunay(
+                                            sourceBitmap!!,
+                                            selectedSourceIndex!!,
+                                            targetBitmap!!,
+                                            selectedTargetIndices.toList()
+                                        ) { msg, pct ->
+                                            status = msg
+                                            progress = pct.coerceIn(0f, 1f)
+                                        }
+                                        if (res != null) {
+                                            resultBitmap = res
+                                            status = "Swap complete"
+                                        } else {
+                                            status = "Swap failed or cancelled"
+                                        }
+                                        busy = false
+                                    }
+                                } else {
+                                    status = "Please pick both source & target images and select faces"
+                                }
+                            }) {
+                                Text("Swap")
+                            }
+                        }
+
+                        Spacer(modifier = Modifier.height(12.dp))
+
+                        Column(modifier = Modifier.fillMaxWidth()) {
+                            LinearProgressIndicator(progress = progress, color = Color.Red, backgroundColor = Color.DarkGray, modifier = Modifier.fillMaxWidth().height(6.dp))
+                            Spacer(modifier = Modifier.height(6.dp))
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Text(status, color = Color.LightGray)
+                                Spacer(modifier = Modifier.width(12.dp))
+                                if (busy) CircularProgressIndicator(color = Color.Red, strokeWidth = 2.dp, modifier = Modifier.size(18.dp))
+                            }
+                        }
+
+                        Spacer(modifier = Modifier.height(12.dp))
+
+                        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceEvenly) {
+                            ImageWithFaceOverlay(
+                                bitmap = sourceBitmap,
+                                faces = sourceFaces,
+                                selectedFaces = selectedSourceIndex?.let { setOf(it) } ?: emptySet(),
+                                onFaceTap = { faceId ->
+                                    selectedSourceIndex = faceId
+                                },
+                                label = "Source"
+                            )
+
+                            ImageWithFaceOverlay(
+                                bitmap = targetBitmap,
+                                faces = targetFaces,
+                                selectedFaces = selectedTargetIndices,
+                                onFaceTap = { faceId ->
+                                    if (selectedTargetIndices.contains(faceId)) selectedTargetIndices.remove(faceId) else selectedTargetIndices.add(faceId)
+                                    selectedTargetIndices = selectedTargetIndices.toMutableSet()
+                                },
+                                label = "Target"
+                            )
+
+                            Box(modifier = Modifier.size(140.dp).background(Color.DarkGray, RoundedCornerShape(6.dp)), contentAlignment = Alignment.Center) {
+                                resultBitmap?.let { bmp ->
+                                    androidx.compose.foundation.Image(bitmap = bmp.asImageBitmap(), contentDescription = "result", modifier = Modifier.fillMaxSize())
+                                } ?: Text("Result", color = Color.Gray)
+                            }
+                        }
+
+                        Spacer(modifier = Modifier.height(12.dp))
+
+                        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceEvenly) {
+                            Button(onClick = { status = "Save not implemented yet" }) { Text("Save", color = Color.White) }
+                            Button(onClick = { status = "Share not implemented yet" }) { Text("Share", color = Color.White) }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun ImageWithFaceOverlay(
+    bitmap: Bitmap?,
+    faces: List<FaceInfo>,
+    selectedFaces: Set<Int>,
+    onFaceTap: (Int) -> Unit,
+    label: String
+) {
+    val boxSize = 140.dp
+    Box(modifier = Modifier
+        .width(boxSize)
+        .height(boxSize)
+        .background(Color.Black, RoundedCornerShape(6.dp)),
+        contentAlignment = Alignment.Center) {
+        if (bitmap == null) {
+            Text(label, color = Color.Gray)
+            return@Box
+        }
+
+        var layoutSize by remember { mutableStateOf(IntSize(1, 1)) }
+
+        Box(modifier = Modifier
+            .fillMaxSize()
+            .onGloballyPositioned { coords ->
+                layoutSize = coords.size
+            }
+            .pointerInput(faces, bitmap, layoutSize) {
+                detectTapGestures { offset ->
+                    val imgW = bitmap.width.toFloat()
+                    val imgH = bitmap.height.toFloat()
+                    val layoutW = layoutSize.width.toFloat().coerceAtLeast(1f)
+                    val layoutH = layoutSize.height.toFloat().coerceAtLeast(1f)
+
+                    val scale = min(layoutW / imgW, layoutH / imgH)
+                    val displayedW = imgW * scale
+                    val displayedH = imgH * scale
+                    val left = (layoutW - displayedW) / 2f
+                    val top = (layoutH - displayedH) / 2f
+
+                    val xImg = ((offset.x - left) / displayedW) * imgW
+                    val yImg = ((offset.y - top) / displayedH) * imgH
+
+                    for (f in faces) {
+                        val r = f.boundingBox
+                        if (xImg >= r.left && xImg <= r.right && yImg >= r.top && yImg <= r.bottom) {
+                            onFaceTap(f.id)
+                            break
+                        }
+                    }
+                }
+            }
+        ) {
+            Canvas(modifier = Modifier.fillMaxSize()) {
+                val imgW = bitmap.width.toFloat()
+                val imgH = bitmap.height.toFloat()
+                val layoutW = size.width
+                val layoutH = size.height
+                val scale = min(layoutW / imgW, layoutH / imgH)
+                val displayedW = imgW * scale
+                val displayedH = imgH * scale
+                val left = (layoutW - displayedW) / 2f
+                val top = (layoutH - displayedH) / 2f
+
+                drawIntoCanvas { canvas ->
+                    canvas.nativeCanvas.drawBitmap(bitmap, null, android.graphics.RectF(left, top, left + displayedW, top + displayedH), null)
+                }
+
+                for (f in faces) {
+                    val rect = f.boundingBox
+                    val l = left + (rect.left.toFloat() / imgW) * displayedW
+                    val t = top + (rect.top.toFloat() / imgH) * displayedH
+                    val r = left + (rect.right.toFloat() / imgW) * displayedW
+                    val b = top + (rect.bottom.toFloat() / imgH) * displayedH
+                    val isSelected = selectedFaces.contains(f.id)
+                    val strokeColor = if (isSelected) Color.Red else Color.White.copy(alpha = 0.6f)
+                    drawRect(
+                        color = strokeColor,
+                        topLeft = Offset(l, t),
+                        size = androidx.compose.ui.geometry.Size(r - l, b - t),
+                        style = Stroke(width = if (isSelected) 3f else 2f)
+                    )
+                }
+            }
+        }
+    }
+}
