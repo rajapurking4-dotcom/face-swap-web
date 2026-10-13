@@ -225,6 +225,87 @@ class FaceSwapProcessor(private val context: Context) {
         return warped
     }
 
+    /**
+     * Matches the warped source face to the target's skin tone / lighting (Reinhard color
+     * transfer in LAB space, measured only inside the face), then blends it in with a
+     * feathered (soft-edged) mask. All Mats are 3-channel 8-bit RGB.
+     */
+    private fun blendWithColorTransfer(warpedSrc: Mat, tgtMat: Mat, faceMask: Mat, faceWidth: Int): Mat {
+        // Where the warped source really has pixels (triangles can leave tiny gaps).
+        val gray = Mat()
+        Imgproc.cvtColor(warpedSrc, gray, Imgproc.COLOR_RGB2GRAY)
+        val nonBlack = Mat()
+        Imgproc.threshold(gray, nonBlack, 0.0, 255.0, Imgproc.THRESH_BINARY)
+        val valid = Mat()
+        Core.bitwise_and(nonBlack, faceMask, valid)
+        val closeK = Imgproc.getStructuringElement(Imgproc.MORPH_ELLIPSE, Size(5.0, 5.0))
+        Imgproc.morphologyEx(valid, valid, Imgproc.MORPH_CLOSE, closeK)
+        Core.bitwise_and(valid, faceMask, valid)
+
+        // Shrink a little so the blend stays inside the face (away from hair/background).
+        val er = maxOf(2, (faceWidth * 0.03).toInt())
+        val erodeK = Imgproc.getStructuringElement(Imgproc.MORPH_ELLIPSE, Size(2.0 * er + 1, 2.0 * er + 1))
+        val inner = Mat()
+        Imgproc.erode(valid, inner, erodeK)
+        val region = if (Core.countNonZero(inner) >= 100) inner else valid
+
+        var corrected = warpedSrc
+        if (Core.countNonZero(region) >= 100) {
+            val srcLab = Mat()
+            Imgproc.cvtColor(warpedSrc, srcLab, Imgproc.COLOR_RGB2Lab)
+            val tgtLab = Mat()
+            Imgproc.cvtColor(tgtMat, tgtLab, Imgproc.COLOR_RGB2Lab)
+
+            val sMean = MatOfDouble(); val sStd = MatOfDouble()
+            val tMean = MatOfDouble(); val tStd = MatOfDouble()
+            Core.meanStdDev(srcLab, sMean, sStd, region)
+            Core.meanStdDev(tgtLab, tMean, tStd, region)
+            val sm = sMean.toArray(); val ss = sStd.toArray()
+            val tm = tMean.toArray(); val ts = tStd.toArray()
+
+            val chans = ArrayList<Mat>()
+            Core.split(srcLab, chans)
+            for (c in 0..2) {
+                val scale = (ts[c] / maxOf(ss[c], 1.0)).coerceIn(0.7, 1.4)
+                val shift = tm[c] - sm[c] * scale
+                chans[c].convertTo(chans[c], CvType.CV_8U, scale, shift)
+            }
+            val labAdj = Mat()
+            Core.merge(chans, labAdj)
+            val rgbAdj = Mat()
+            Imgproc.cvtColor(labAdj, rgbAdj, Imgproc.COLOR_Lab2RGB)
+            corrected = rgbAdj
+        }
+
+        // Feathered alpha mask.
+        var featherK = (faceWidth * 0.08).toInt()
+        if (featherK % 2 == 0) featherK += 1
+        if (featherK < 5) featherK = 5
+        val alpha8 = Mat()
+        Imgproc.GaussianBlur(region, alpha8, Size(featherK.toDouble(), featherK.toDouble()), 0.0)
+        val alphaF = Mat()
+        alpha8.convertTo(alphaF, CvType.CV_32F, 1.0 / 255.0)
+        val alpha3 = Mat()
+        Core.merge(listOf(alphaF, alphaF, alphaF), alpha3)
+
+        val srcF = Mat()
+        corrected.convertTo(srcF, CvType.CV_32FC3)
+        val tgtF = Mat()
+        tgtMat.convertTo(tgtF, CvType.CV_32FC3)
+        val ones = Mat(alpha3.size(), CvType.CV_32FC3, Scalar(1.0, 1.0, 1.0))
+        val invAlpha = Mat()
+        Core.subtract(ones, alpha3, invAlpha)
+        val fg = Mat()
+        Core.multiply(srcF, alpha3, fg)
+        val bg = Mat()
+        Core.multiply(tgtF, invAlpha, bg)
+        val outF = Mat()
+        Core.add(fg, bg, outF)
+        val out = Mat()
+        outF.convertTo(out, CvType.CV_8UC3)
+        return out
+    }
+
     private fun applyDelaunayWarpAndBlend(srcMat: Mat, srcFaceInfo: FaceInfo, tgtMat: Mat, tgtFaceInfo: FaceInfo): Mat {
         var srcPts = toCvPoints(srcFaceInfo.contourPoints)
         var tgtPts = toCvPoints(tgtFaceInfo.contourPoints)
@@ -243,7 +324,7 @@ class FaceSwapProcessor(private val context: Context) {
 
         val warpedSrc = warpWithDelaunay(srcMat, srcPts, tgtPts, Size(tgtMat.cols().toDouble(), tgtMat.rows().toDouble()))
 
-        // Proper convex hull of the target face points as the blend mask.
+        // Proper convex hull of the target face points as the face mask.
         val mask = Mat.zeros(tgtMat.rows(), tgtMat.cols(), CvType.CV_8UC1)
         var maskRect = Rect(0, 0, tgtMat.cols(), tgtMat.rows())
         try {
@@ -259,28 +340,10 @@ class FaceSwapProcessor(private val context: Context) {
             maskRect = Rect(0, 0, tgtMat.cols(), tgtMat.rows())
         }
 
-        // seamlessClone places the center of the mask's bounding rect at this point,
-        // so it must be the center of the mask rect (NOT the face bounding box).
-        val center = Point(maskRect.x + maskRect.width / 2.0, maskRect.y + maskRect.height / 2.0)
-
-        val output = Mat()
-        try {
-            org.opencv.photo.Photo.seamlessClone(warpedSrc, tgtMat, mask, center, output, org.opencv.photo.Photo.NORMAL_CLONE)
-            return output
+        return try {
+            blendWithColorTransfer(warpedSrc, tgtMat, mask, maskRect.width)
         } catch (e: Exception) {
-            val outClone = tgtMat.clone()
-            val mask3c = Mat()
-            Imgproc.cvtColor(mask, mask3c, Imgproc.COLOR_GRAY2BGR)
-            val fg = Mat()
-            Core.bitwise_and(warpedSrc, mask3c, fg)
-            val inv = Mat()
-            Core.bitwise_not(mask, inv)
-            val inv3c = Mat()
-            Imgproc.cvtColor(inv, inv3c, Imgproc.COLOR_GRAY2BGR)
-            val bg = Mat()
-            Core.bitwise_and(outClone, inv3c, bg)
-            Core.add(bg, fg, outClone)
-            return outClone
+            tgtMat.clone()
         }
     }
 
@@ -306,7 +369,7 @@ class FaceSwapProcessor(private val context: Context) {
             return null
         }
 
-        // Convert to 3-channel RGB: the warp/blend code (masks, seamlessClone) needs 3 channels.
+        // Convert to 3-channel RGB: the warp/blend code (masks, color transfer) needs 3 channels.
         val tgtMat = rgbaToRgb(OpenCVUtils.bitmapToMat(targetBitmap))
         val srcMat = rgbaToRgb(OpenCVUtils.bitmapToMat(sourceBitmap))
 
