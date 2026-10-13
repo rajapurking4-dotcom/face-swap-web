@@ -38,14 +38,11 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-gradle-
 
-      - name: Make gradlew executable
-        run: chmod +x ./gradlew
-
       - name: Build with Gradle
-        run: ./gradlew assembleDebug --no-daemon --stacktrace
+        run: gradle assembleDebug --no-daemon --stacktrace
 
       - name: Run unit tests
-        run: ./gradlew test --no-daemon || true
+        run: gradle test --no-daemon || true
 
       - name: Upload debug APK artifact
         uses: actions/upload-artifact@v4
