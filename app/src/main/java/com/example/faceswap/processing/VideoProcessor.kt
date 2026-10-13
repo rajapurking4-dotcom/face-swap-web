@@ -4,6 +4,7 @@ import android.content.ContentValues
 import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.graphics.PointF
 import android.net.Uri
 import android.os.Build
 import android.os.Environment
@@ -13,12 +14,14 @@ import com.arthenica.ffmpegkit.ReturnCode
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.io.File
+import kotlin.math.hypot
 
 /**
  * Handles video face-swap by:
  * 1. Extracting frames from the input video with FFmpegKit (as JPEG - the PNG encoder
  *    is disabled in this FFmpegKit build).
- * 2. Running the existing FaceSwapProcessor on each frame.
+ * 2. Running the face swap on each frame, with the face points smoothed over time so the
+ *    swapped face does not jitter.
  * 3. Re-encoding the processed frames back into a video with FFmpegKit (mpeg4 encoder).
  * 4. Saving the finished video to the Gallery (Movies/FaceSwap).
  */
@@ -41,6 +44,13 @@ class VideoProcessor(private val context: Context) {
         outFramesDir.mkdirs()
 
         try {
+            onProgress("Preparing source face...", 0.01f)
+            val prepared = faceSwapProcessor.prepareSource(sourceBitmap, sourceFaceId)
+            if (prepared == null) {
+                onProgress("No face found in the source photo", 0f)
+                return@withContext null
+            }
+
             onProgress("Copying video...", 0.02f)
             val inputVideoFile = copyUriToFile(videoUri, File(workDir, "input.mp4"))
             if (inputVideoFile == null) {
@@ -65,19 +75,33 @@ class VideoProcessor(private val context: Context) {
             }
 
             val total = frameFiles.size
+            var prevFaces: List<FaceInfo> = emptyList()
+            var missed = 0
             frameFiles.forEachIndexed { index, frameFile ->
                 val bmp = BitmapFactory.decodeFile(frameFile.absolutePath)
                 if (bmp != null) {
-                    val targetFaces = faceSwapProcessor.detectFaces(bmp)
-                    val matchingTargetIds = targetFaces.map { it.id }
-                    val swapped = if (matchingTargetIds.isNotEmpty()) {
+                    val detected = try {
+                        faceSwapProcessor.detectFaces(bmp)
+                    } catch (e: Exception) {
+                        emptyList()
+                    }
+
+                    // Smooth the face points over time to remove frame-to-frame jitter.
+                    val faces: List<FaceInfo> = if (detected.isNotEmpty()) {
+                        missed = 0
+                        detected.map { smoothFace(it, matchPrevious(it, prevFaces)) }
+                    } else if (prevFaces.isNotEmpty() && missed < 5) {
+                        // Detection missed this frame: keep using the last known face.
+                        missed++
+                        prevFaces
+                    } else {
+                        emptyList()
+                    }
+                    prevFaces = faces
+
+                    val swapped = if (faces.isNotEmpty()) {
                         try {
-                            faceSwapProcessor.swapFacesWithDelaunay(
-                                sourceBitmap,
-                                sourceFaceId,
-                                bmp,
-                                matchingTargetIds
-                            ) { _, _ -> }
+                            faceSwapProcessor.swapPrepared(prepared, bmp, faces)
                         } catch (e: Exception) {
                             null
                         }
@@ -111,6 +135,49 @@ class VideoProcessor(private val context: Context) {
             onProgress("Error: ${e.message}", 0f)
             null
         }
+    }
+
+    /** Finds the face from the previous frame that is closest to this one (same person). */
+    private fun matchPrevious(cur: FaceInfo, prev: List<FaceInfo>): FaceInfo? {
+        val c = cur.boundingBox
+        var best: FaceInfo? = null
+        var bestD = Float.MAX_VALUE
+        for (p in prev) {
+            val d = hypot(
+                c.exactCenterX() - p.boundingBox.exactCenterX(),
+                c.exactCenterY() - p.boundingBox.exactCenterY()
+            )
+            if (d < bestD) {
+                bestD = d
+                best = p
+            }
+        }
+        return if (best != null && bestD < 0.6f * c.width()) best else null
+    }
+
+    /**
+     * Adaptive smoothing: tiny movements (detector noise) are heavily smoothed,
+     * real fast head movement passes through almost unchanged (no lag).
+     */
+    private fun smoothFace(cur: FaceInfo, prev: FaceInfo?): FaceInfo {
+        if (prev == null || prev.contourPoints.size != cur.contourPoints.size || cur.contourPoints.isEmpty()) {
+            return cur
+        }
+        val fw = cur.boundingBox.width().toFloat().coerceAtLeast(1f)
+        var sum = 0f
+        for (i in cur.contourPoints.indices) {
+            val a = cur.contourPoints[i]
+            val b = prev.contourPoints[i]
+            sum += hypot(a.x - b.x, a.y - b.y)
+        }
+        val meanMove = sum / cur.contourPoints.size
+        val alpha = (meanMove / (0.05f * fw)).coerceIn(0.2f, 1f)
+        val pts = cur.contourPoints.indices.map { i ->
+            val a = cur.contourPoints[i]
+            val b = prev.contourPoints[i]
+            PointF(b.x + (a.x - b.x) * alpha, b.y + (a.y - b.y) * alpha)
+        }
+        return cur.copy(contourPoints = pts)
     }
 
     private fun logTail(logs: String?): String {
