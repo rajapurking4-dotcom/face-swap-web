@@ -35,6 +35,14 @@ class MainActivity : ComponentActivity() {
 
     private val faceSwapProcessor by lazy { FaceSwapProcessor(this) }
 
+    // The compose UI sets this; the launcher below forwards the picked image to it.
+    private var onImagePicked: (Uri?) -> Unit = {}
+
+    // Must be registered at Activity level (before STARTED), NOT inside setContent {}.
+    private val pickImage = registerForActivityResult(ActivityResultContracts.GetContent()) { uri: Uri? ->
+        onImagePicked(uri)
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         OpenCVUtils.initOpenCV(this)
@@ -57,7 +65,7 @@ class MainActivity : ComponentActivity() {
                 var busy by remember { mutableStateOf(false) }
                 var resultBitmap by remember { mutableStateOf<Bitmap?>(null) }
 
-                val pickImage = registerForActivityResult(ActivityResultContracts.GetContent()) { uri: Uri? ->
+                onImagePicked = { uri: Uri? ->
                     uri?.let { u ->
                         contentResolver.openInputStream(u)?.use { stream ->
                             val bmp = android.graphics.BitmapFactory.decodeStream(stream)
@@ -85,6 +93,7 @@ class MainActivity : ComponentActivity() {
                             }
                         }
                     }
+                    Unit
                 }
 
                 Scaffold(
