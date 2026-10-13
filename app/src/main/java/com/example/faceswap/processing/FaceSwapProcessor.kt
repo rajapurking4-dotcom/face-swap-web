@@ -109,6 +109,19 @@ class FaceSwapProcessor(private val context: Context) {
         return list.map { Point(it.x.toDouble(), it.y.toDouble()) }
     }
 
+    /** Bitmap->Mat gives 4-channel RGBA. The warp/blend code works on 3-channel images. */
+    private fun rgbaToRgb(mat: Mat): Mat {
+        val out = Mat()
+        Imgproc.cvtColor(mat, out, Imgproc.COLOR_RGBA2RGB)
+        return out
+    }
+
+    private fun rgbToRgba(mat: Mat): Mat {
+        val out = Mat()
+        Imgproc.cvtColor(mat, out, Imgproc.COLOR_RGB2RGBA)
+        return out
+    }
+
     private fun warpWithDelaunay(srcMat: Mat, srcPts: List<Point>, tgtPts: List<Point>, targetSize: Size): Mat {
         val w = targetSize.width.roundToInt()
         val h = targetSize.height.roundToInt()
@@ -271,8 +284,9 @@ class FaceSwapProcessor(private val context: Context) {
             return null
         }
 
-        val tgtMat = OpenCVUtils.bitmapToMat(targetBitmap)
-        val srcMat = OpenCVUtils.bitmapToMat(sourceBitmap)
+        // Convert to 3-channel RGB: the warp/blend code (masks, seamlessClone) needs 3 channels.
+        val tgtMat = rgbaToRgb(OpenCVUtils.bitmapToMat(targetBitmap))
+        val srcMat = rgbaToRgb(OpenCVUtils.bitmapToMat(sourceBitmap))
 
         var output = tgtMat.clone()
         val targets = selectedTargetIndices.mapNotNull { idx -> targetInfos.getOrNull(idx) }
@@ -290,7 +304,7 @@ class FaceSwapProcessor(private val context: Context) {
             progressCallback("Completed ${i+1}/$total", stageBase + 0.7f * ((i + 1).toFloat() / total))
         }
         progressCallback("Finalizing", 0.98f)
-        val bmp = OpenCVUtils.matToBitmap(output)
+        val bmp = OpenCVUtils.matToBitmap(rgbToRgba(output))
         progressCallback("Done", 1.0f)
         return bmp
     }
