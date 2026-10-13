@@ -15,6 +15,9 @@ import kotlin.math.hypot
 import kotlin.math.min
 import kotlin.math.roundToInt
 
+/** A source face prepared once (RGB image + detected face), reusable for many target frames. */
+class PreparedSource(val mat: Mat, val info: FaceInfo)
+
 class FaceSwapProcessor(private val context: Context) {
 
     private val detector by lazy {
@@ -52,6 +55,11 @@ class FaceSwapProcessor(private val context: Context) {
                 }
             }
             // Fixed order + fixed point count per contour => source/target points correspond 1-to-1.
+            // Index layout when complete (133 points):
+            //  0-35 face oval | 36-40 L brow top | 41-45 L brow bottom | 46-61 L eye
+            //  62-66 R brow top | 67-71 R brow bottom | 72-87 R eye | 88-89 nose bridge
+            //  90-92 nose bottom | 93-103 upper lip top | 104-112 upper lip bottom
+            //  113-121 lower lip top | 122-130 lower lip bottom | 131 L cheek | 132 R cheek
             addContour(f.getContour(FaceContour.FACE))
             addContour(f.getContour(FaceContour.LEFT_EYEBROW_TOP))
             addContour(f.getContour(FaceContour.LEFT_EYEBROW_BOTTOM))
@@ -76,40 +84,6 @@ class FaceSwapProcessor(private val context: Context) {
             out.add(FaceInfo(idx, bbox, lands, contourPts))
         }
         return out
-    }
-
-    private fun resampleContour(points: List<PointF>, n: Int): List<PointF> {
-        if (points.isEmpty()) return emptyList()
-        if (points.size == 1) return List(n) { points.first() }
-        val dists = DoubleArray(points.size)
-        dists[0] = 0.0
-        for (i in 1 until points.size) {
-            val dx = (points[i].x - points[i - 1].x).toDouble()
-            val dy = (points[i].y - points[i - 1].y).toDouble()
-            dists[i] = dists[i - 1] + hypot(dx, dy)
-        }
-        val total = dists.last()
-        if (total <= 0.0) return List(n) { points.first() }
-        val resampled = mutableListOf<PointF>()
-        val step = total / n.toDouble()
-        var idx = 0
-        for (i in 0 until n) {
-            val target = i * step
-            while (idx < dists.size - 1 && dists[idx + 1] < target) idx++
-            val t0 = dists[idx]
-            val t1 = dists[min(idx + 1, dists.size - 1)]
-            if (t1 - t0 == 0.0) {
-                resampled.add(points[idx])
-            } else {
-                val ratio = ((target - t0) / (t1 - t0)).toFloat()
-                val p0 = points[idx]
-                val p1 = points[min(idx + 1, points.size - 1)]
-                val x = p0.x + (p1.x - p0.x) * ratio
-                val y = p0.y + (p1.y - p0.y) * ratio
-                resampled.add(PointF(x, y))
-            }
-        }
-        return resampled
     }
 
     private fun toCvPoints(list: List<PointF>): List<Point> {
@@ -250,13 +224,46 @@ class FaceSwapProcessor(private val context: Context) {
     }
 
     /**
+     * Mask (inside the ROI crop) of the facial features that are NOT skin:
+     * eyes, eyebrows and mouth. Needs the full 133-point contour layout.
+     */
+    private fun buildExclusionMask(pts: List<Point>, roi: Rect, faceWidth: Int): Mat {
+        val excl = Mat.zeros(roi.height, roi.width, CvType.CV_8UC1)
+        if (pts.size != 133) return excl
+
+        fun fillHull(from: Int, toInclusive: Int) {
+            val shifted = (from..toInclusive).map { Point(pts[it].x - roi.x, pts[it].y - roi.y) }
+            val m = MatOfPoint(*shifted.toTypedArray())
+            val hullIdx = MatOfInt()
+            Imgproc.convexHull(m, hullIdx)
+            val hp = hullIdx.toArray().map { shifted[it] }
+            Imgproc.fillConvexPoly(excl, MatOfPoint(*hp.toTypedArray()), Scalar(255.0))
+        }
+        try {
+            fillHull(36, 45)    // left eyebrow
+            fillHull(46, 61)    // left eye
+            fillHull(62, 71)    // right eyebrow
+            fillHull(72, 87)    // right eye
+            fillHull(93, 130)   // mouth
+        } catch (e: Exception) {
+            return Mat.zeros(roi.height, roi.width, CvType.CV_8UC1)
+        }
+        val d = maxOf(1, (faceWidth * 0.035).toInt())
+        val k = Imgproc.getStructuringElement(Imgproc.MORPH_ELLIPSE, Size(2.0 * d + 1, 2.0 * d + 1))
+        val dil = Mat()
+        Imgproc.dilate(excl, dil, k)
+        return dil
+    }
+
+    /**
      * Blends the warped source face into the target using frequency separation in LAB:
      *  - fine detail (eyes, lips, nose shape) comes from the source face
      *  - overall lighting, shadows and skin color (low frequencies) come from the target
-     * This removes the source's dark eye circles / shadows and any skin-tone mismatch.
+     * The low frequencies are measured on SKIN ONLY (eyes, eyebrows, mouth excluded), so
+     * the dark features themselves do not turn into dark halos around the eyes.
      * Works only on a crop around the face. All Mats are 3-channel 8-bit RGB.
      */
-    private fun blendWithColorTransfer(warpedSrc: Mat, tgtMat: Mat, faceMask: Mat, faceRect: Rect): Mat {
+    private fun blendWithColorTransfer(warpedSrc: Mat, tgtMat: Mat, faceMask: Mat, faceRect: Rect, tgtPts: List<Point>): Mat {
         val pad = (faceRect.width * 0.15).toInt()
         val x0 = maxOf(0, faceRect.x - pad)
         val y0 = maxOf(0, faceRect.y - pad)
@@ -289,6 +296,14 @@ class FaceSwapProcessor(private val context: Context) {
         val region = if (Core.countNonZero(inner) >= 100) inner else valid
         if (Core.countNonZero(region) < 100) return tgtMat.clone()
 
+        // Skin-only mask used to measure the low-frequency lighting.
+        val excl = buildExclusionMask(tgtPts, roi, faceWidth)
+        val notExcl = Mat()
+        Core.bitwise_not(excl, notExcl)
+        val skinTmp = Mat()
+        Core.bitwise_and(region, notExcl, skinTmp)
+        val skin = if (Core.countNonZero(skinTmp) >= 100) skinTmp else region
+
         // ---- Frequency separation in LAB ----
         val srcLab8 = Mat()
         Imgproc.cvtColor(src, srcLab8, Imgproc.COLOR_RGB2Lab)
@@ -300,8 +315,8 @@ class FaceSwapProcessor(private val context: Context) {
         Core.split(tgtLab8, tCh)
 
         val maskF = Mat()
-        region.convertTo(maskF, CvType.CV_32F, 1.0 / 255.0)
-        val sigmaL = maxOf(2.0, faceWidth * 0.14)   // lightness: keeps eye/lip/nose structure
+        skin.convertTo(maskF, CvType.CV_32F, 1.0 / 255.0)
+        val sigmaL = maxOf(2.0, faceWidth * 0.18)   // lightness: broad shading comes from the target
         val sigmaC = maxOf(3.0, faceWidth * 0.30)   // color: almost fully from the target skin
         val maskBlurL = blurredMask(maskF, sigmaL)
         val maskBlurC = blurredMask(maskF, sigmaC)
@@ -364,11 +379,6 @@ class FaceSwapProcessor(private val context: Context) {
     private fun applyDelaunayWarpAndBlend(srcMat: Mat, srcFaceInfo: FaceInfo, tgtMat: Mat, tgtFaceInfo: FaceInfo): Mat {
         var srcPts = toCvPoints(srcFaceInfo.contourPoints)
         var tgtPts = toCvPoints(tgtFaceInfo.contourPoints)
-        if (srcPts.size != tgtPts.size) {
-            // Some contour was missing on one face: fall back to equal-size resampling.
-            srcPts = toCvPoints(resampleContour(srcFaceInfo.contourPoints, 100))
-            tgtPts = toCvPoints(resampleContour(tgtFaceInfo.contourPoints, 100))
-        }
         // Keep all points inside their images (Subdiv2D requires this).
         val tMaxX = tgtMat.cols() - 1.0
         val tMaxY = tgtMat.rows() - 1.0
@@ -396,10 +406,31 @@ class FaceSwapProcessor(private val context: Context) {
         }
 
         return try {
-            blendWithColorTransfer(warpedSrc, tgtMat, mask, maskRect)
+            blendWithColorTransfer(warpedSrc, tgtMat, mask, maskRect, tgtPts)
         } catch (e: Exception) {
             tgtMat.clone()
         }
+    }
+
+    /** Detects + converts the source photo once. Returns null if no face was found. */
+    suspend fun prepareSource(sourceBitmap: Bitmap, sourceFaceIndex: Int): PreparedSource? {
+        val infos = detectFaces(sourceBitmap)
+        if (infos.isEmpty()) return null
+        val info = infos.getOrNull(sourceFaceIndex) ?: infos.first()
+        return PreparedSource(rgbaToRgb(OpenCVUtils.bitmapToMat(sourceBitmap)), info)
+    }
+
+    /**
+     * Swaps the prepared source face onto the given (already detected) target faces.
+     * Faces whose contour layout does not match the source are left untouched.
+     */
+    fun swapPrepared(source: PreparedSource, targetBitmap: Bitmap, targets: List<FaceInfo>): Bitmap {
+        var output = rgbaToRgb(OpenCVUtils.bitmapToMat(targetBitmap))
+        for (t in targets) {
+            if (t.contourPoints.size != source.info.contourPoints.size) continue
+            output = applyDelaunayWarpAndBlend(source.mat, source.info, output, t)
+        }
+        return OpenCVUtils.matToBitmap(rgbToRgba(output))
     }
 
     suspend fun swapFacesWithDelaunay(
@@ -410,41 +441,32 @@ class FaceSwapProcessor(private val context: Context) {
         progressCallback: (String, Float) -> Unit
     ): Bitmap? {
         progressCallback("Detecting source faces...", 0.02f)
-        val sourceInfos = detectFaces(sourceBitmap, samplingPoints = 100)
-        if (sourceInfos.isEmpty()) {
+        val prepared = prepareSource(sourceBitmap, sourceFaceIndex)
+        if (prepared == null) {
             progressCallback("No face found in source image", 0f)
             return null
         }
-        val srcInfo = sourceInfos.getOrNull(sourceFaceIndex) ?: sourceInfos.first()
 
         progressCallback("Detecting target faces...", 0.08f)
-        val targetInfos = detectFaces(targetBitmap, samplingPoints = 100)
+        val targetInfos = detectFaces(targetBitmap)
         if (targetInfos.isEmpty()) {
             progressCallback("No faces in target image", 0f)
             return null
         }
 
-        // Convert to 3-channel RGB: the warp/blend code (masks, color work) needs 3 channels.
-        val tgtMat = rgbaToRgb(OpenCVUtils.bitmapToMat(targetBitmap))
-        val srcMat = rgbaToRgb(OpenCVUtils.bitmapToMat(sourceBitmap))
-
-        var output = tgtMat.clone()
         val targets = selectedTargetIndices.mapNotNull { idx -> targetInfos.getOrNull(idx) }
         if (targets.isEmpty()) {
             progressCallback("No target faces selected", 0f)
             return null
         }
-
-        val total = targets.size
-        for ((i, tgtInfo) in targets.withIndex()) {
-            val stageBase = 0.1f + (i.toFloat() / total) * 0.7f
-            progressCallback("Warping face ${i+1}/$total", stageBase)
-            val blended = applyDelaunayWarpAndBlend(srcMat, srcInfo, output, tgtInfo)
-            output = blended
-            progressCallback("Completed ${i+1}/$total", stageBase + 0.7f * ((i + 1).toFloat() / total))
+        val usable = targets.filter { it.contourPoints.size == prepared.info.contourPoints.size }
+        if (usable.isEmpty()) {
+            progressCallback("Face details not detected clearly - try a clearer, front-facing photo", 0f)
+            return null
         }
-        progressCallback("Finalizing", 0.98f)
-        val bmp = OpenCVUtils.matToBitmap(rgbToRgba(output))
+
+        progressCallback("Swapping ${usable.size} face(s)...", 0.3f)
+        val bmp = swapPrepared(prepared, targetBitmap, usable)
         progressCallback("Done", 1.0f)
         return bmp
     }
