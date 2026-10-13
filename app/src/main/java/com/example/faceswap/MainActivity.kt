@@ -10,7 +10,9 @@ import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -112,7 +114,7 @@ class MainActivity : ComponentActivity() {
                 onVideoPicked = { uri: Uri? ->
                     videoUri = uri
                     outputVideoPath = null
-                    videoStatus = if (uri != null) "Video selected" else "No video selected"
+                    videoStatus = if (uri != null) "Video selected: ${uri.lastPathSegment ?: "ok"}" else "No video selected"
                     Unit
                 }
 
@@ -129,6 +131,7 @@ class MainActivity : ComponentActivity() {
                         .padding(padding)
                         .fillMaxSize()
                         .background(Color.Black)
+                        .verticalScroll(rememberScrollState())
                         .padding(12.dp)) {
 
                         Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
@@ -242,14 +245,15 @@ class MainActivity : ComponentActivity() {
                                         }
                                         if (outFile != null) {
                                             outputVideoPath = outFile.absolutePath
-                                            videoStatus = "Video swap complete: ${outFile.name}"
-                                        } else {
+                                        } else if (!videoStatus.startsWith("Video") && !videoStatus.startsWith("Frame") && !videoStatus.startsWith("Error") && !videoStatus.startsWith("Could not") && !videoStatus.startsWith("No frames")) {
                                             videoStatus = "Video swap failed"
                                         }
                                         videoBusy = false
                                     }
+                                } else if (uri == null) {
+                                    videoStatus = "Pick a video first"
                                 } else {
-                                    videoStatus = "Pick a source face and a video first"
+                                    videoStatus = "Pick a source photo (with a face) first using 'Pick Source/Target'"
                                 }
                             }) {
                                 Text("Swap Video")
@@ -266,11 +270,13 @@ class MainActivity : ComponentActivity() {
                                 Spacer(modifier = Modifier.width(12.dp))
                                 if (videoBusy) CircularProgressIndicator(color = Color.Red, strokeWidth = 2.dp, modifier = Modifier.size(18.dp))
                             }
-                            outputVideoPath?.let { path ->
+                            outputVideoPath?.let {
                                 Spacer(modifier = Modifier.height(4.dp))
-                                Text("Saved to: $path", color = Color.Gray, style = MaterialTheme.typography.caption)
+                                Text("Finished video is in your Gallery / Movies / FaceSwap", color = Color.Gray, style = MaterialTheme.typography.caption)
                             }
                         }
+
+                        Spacer(modifier = Modifier.height(32.dp))
                     }
                 }
             }
