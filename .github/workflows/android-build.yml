@@ -7,7 +7,7 @@ on:
     branches: [ "main" ]
 
 jobs:
-  build:
+    build:
       runs-on: ubuntu-latest
     env:
       ANDROID_SDK_ROOT: $ANDROID_SDK_ROOT/android-sdk
