@@ -1,20 +1,19 @@
 plugins {
     id 'com.android.application'
-    id 'org.jetbrains.kotlin.android'
+    id 'kotlin-android'
 }
 
 android {
     namespace 'com.example.faceswap'
-    compileSdk 34
+    compileSdk 33
 
     defaultConfig {
         applicationId "com.example.faceswap"
         minSdk 24
-        targetSdk 34
+        targetSdk 33
         versionCode 1
-        versionName "1.0"
-
-        testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
+        versionName "0.1"
+        multiDexEnabled true
     }
 
     buildTypes {
@@ -25,51 +24,45 @@ android {
     }
 
     compileOptions {
-        sourceCompatibility JavaVersion.VERSION_1_8
-        targetCompatibility JavaVersion.VERSION_1_8
+        sourceCompatibility JavaVersion.VERSION_11
+        targetCompatibility JavaVersion.VERSION_11
     }
-
-    kotlinOptions {
-        jvmTarget = '1.8'
-    }
-
+    kotlinOptions { jvmTarget = "11" }
     buildFeatures {
         compose true
     }
-
     composeOptions {
         kotlinCompilerExtensionVersion '1.4.4'
     }
-
     packagingOptions {
-        resources {
-            excludes += '/META-INF/{AL2.0,LGPL2.1}'
-        }
+        pickFirst 'lib/**/libc++_shared.so'
     }
 }
 
 dependencies {
+    implementation "org.jetbrains.kotlin:kotlin-stdlib:1.8.0"
     implementation 'androidx.core:core-ktx:1.10.1'
     implementation 'androidx.lifecycle:lifecycle-runtime-ktx:2.6.1'
-    implementation 'androidx.activity:activity-compose:1.7.2'
-    implementation platform('androidx.compose:compose-bom:2023.06.01')
-    implementation 'androidx.compose.ui:ui'
-    implementation 'androidx.compose.ui:ui-graphics'
-    implementation 'androidx.compose.ui:ui-tooling-preview'
-    implementation 'androidx.compose.material:material'
+    implementation "androidx.activity:activity-compose:1.7.2"
 
+    // Material Components (needed by Theme.MaterialComponents in themes.xml)
     implementation 'com.google.android.material:material:1.9.0'
+
+    // Jetpack Compose
+    implementation "androidx.compose.ui:ui:1.4.3"
+    implementation "androidx.compose.material:material:1.4.3"
+    implementation "androidx.compose.ui:ui-tooling-preview:1.4.3"
+
+    // ML Kit Face Detection (on-device)
+    implementation 'com.google.mlkit:face-detection:16.1.5'
+
+    // Coroutines (play-services provides Task.await())
+    implementation 'org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.1'
     implementation 'org.jetbrains.kotlinx:kotlinx-coroutines-play-services:1.7.1'
 
+    // OpenCV from Maven Central (includes Java API + native libs)
     implementation 'org.opencv:opencv:4.9.0'
 
+    // On-device FFmpeg for video extraction/reassembly (community-maintained FFmpegKit build)
     implementation 'com.mrljdx:ffmpeg-kit-full:6.1.1'
-
-    testImplementation 'junit:junit:4.13.2'
-    androidTestImplementation 'androidx.test.ext:junit:1.1.5'
-    androidTestImplementation 'androidx.test.espresso:espresso-core:3.5.1'
-    androidTestImplementation platform('androidx.compose:compose-bom:2023.06.01')
-    androidTestImplementation 'androidx.compose.ui:ui-test-junit4'
-    debugImplementation 'androidx.compose.ui:ui-tooling'
-    debugImplementation 'androidx.compose.ui:ui-test-manifest'
 }
