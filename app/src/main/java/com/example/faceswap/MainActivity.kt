@@ -28,19 +28,26 @@ import androidx.compose.ui.unit.dp
 import com.example.faceswap.processing.FaceInfo
 import com.example.faceswap.processing.FaceSwapProcessor
 import com.example.faceswap.processing.OpenCVUtils
+import com.example.faceswap.processing.VideoProcessor
 import kotlinx.coroutines.launch
 import kotlin.math.min
 
 class MainActivity : ComponentActivity() {
 
     private val faceSwapProcessor by lazy { FaceSwapProcessor(this) }
+    private val videoProcessor by lazy { VideoProcessor(this) }
 
-    // The compose UI sets this; the launcher below forwards the picked image to it.
+    // The compose UI sets these; the launchers below forward the picked content to them.
     private var onImagePicked: (Uri?) -> Unit = {}
+    private var onVideoPicked: (Uri?) -> Unit = {}
 
     // Must be registered at Activity level (before STARTED), NOT inside setContent {}.
     private val pickImage = registerForActivityResult(ActivityResultContracts.GetContent()) { uri: Uri? ->
         onImagePicked(uri)
+    }
+
+    private val pickVideo = registerForActivityResult(ActivityResultContracts.GetContent()) { uri: Uri? ->
+        onVideoPicked(uri)
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -64,6 +71,12 @@ class MainActivity : ComponentActivity() {
                 var progress by remember { mutableStateOf(0f) }
                 var busy by remember { mutableStateOf(false) }
                 var resultBitmap by remember { mutableStateOf<Bitmap?>(null) }
+
+                var videoUri by remember { mutableStateOf<Uri?>(null) }
+                var videoStatus by remember { mutableStateOf("No video selected") }
+                var videoProgress by remember { mutableStateOf(0f) }
+                var videoBusy by remember { mutableStateOf(false) }
+                var outputVideoPath by remember { mutableStateOf<String?>(null) }
 
                 onImagePicked = { uri: Uri? ->
                     uri?.let { u ->
@@ -93,6 +106,13 @@ class MainActivity : ComponentActivity() {
                             }
                         }
                     }
+                    Unit
+                }
+
+                onVideoPicked = { uri: Uri? ->
+                    videoUri = uri
+                    outputVideoPath = null
+                    videoStatus = if (uri != null) "Video selected" else "No video selected"
                     Unit
                 }
 
@@ -192,6 +212,64 @@ class MainActivity : ComponentActivity() {
                         Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceEvenly) {
                             Button(onClick = { status = "Save not implemented yet" }) { Text("Save", color = Color.White) }
                             Button(onClick = { status = "Share not implemented yet" }) { Text("Share", color = Color.White) }
+                        }
+
+                        Spacer(modifier = Modifier.height(24.dp))
+                        Divider(color = Color.DarkGray)
+                        Spacer(modifier = Modifier.height(12.dp))
+
+                        Text("Video Face Swap", color = Color.Red, style = MaterialTheme.typography.h6)
+                        Spacer(modifier = Modifier.height(8.dp))
+
+                        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                            Button(onClick = { pickVideo.launch("video/*") }) { Text("Pick Video") }
+                            Button(onClick = {
+                                val uri = videoUri
+                                if (sourceBitmap != null && selectedSourceIndex != null && uri != null) {
+                                    scope.launch {
+                                        videoBusy = true
+                                        videoStatus = "Starting video swap..."
+                                        videoProgress = 0f
+                                        val outFile = videoProcessor.swapFacesInVideo(
+                                            sourceBitmap!!,
+                                            selectedSourceIndex!!,
+                                            uri,
+                                            emptyList(),
+                                            faceSwapProcessor
+                                        ) { msg, pct ->
+                                            videoStatus = msg
+                                            videoProgress = pct.coerceIn(0f, 1f)
+                                        }
+                                        if (outFile != null) {
+                                            outputVideoPath = outFile.absolutePath
+                                            videoStatus = "Video swap complete: ${outFile.name}"
+                                        } else {
+                                            videoStatus = "Video swap failed"
+                                        }
+                                        videoBusy = false
+                                    }
+                                } else {
+                                    videoStatus = "Pick a source face and a video first"
+                                }
+                            }) {
+                                Text("Swap Video")
+                            }
+                        }
+
+                        Spacer(modifier = Modifier.height(8.dp))
+
+                        Column(modifier = Modifier.fillMaxWidth()) {
+                            LinearProgressIndicator(progress = videoProgress, color = Color.Red, backgroundColor = Color.DarkGray, modifier = Modifier.fillMaxWidth().height(6.dp))
+                            Spacer(modifier = Modifier.height(6.dp))
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Text(videoStatus, color = Color.LightGray)
+                                Spacer(modifier = Modifier.width(12.dp))
+                                if (videoBusy) CircularProgressIndicator(color = Color.Red, strokeWidth = 2.dp, modifier = Modifier.size(18.dp))
+                            }
+                            outputVideoPath?.let { path ->
+                                Spacer(modifier = Modifier.height(4.dp))
+                                Text("Saved to: $path", color = Color.Gray, style = MaterialTheme.typography.caption)
+                            }
                         }
                     }
                 }
