@@ -16,13 +16,11 @@ import java.io.File
 
 /**
  * Handles video face-swap by:
- * 1. Extracting frames from the input video with FFmpegKit.
+ * 1. Extracting frames from the input video with FFmpegKit (as JPEG - the PNG encoder
+ *    is disabled in this FFmpegKit build).
  * 2. Running the existing FaceSwapProcessor on each frame.
- * 3. Re-encoding the processed frames back into a video with FFmpegKit.
+ * 3. Re-encoding the processed frames back into a video with FFmpegKit (mpeg4 encoder).
  * 4. Saving the finished video to the Gallery (Movies/FaceSwap).
- *
- * This is a straightforward frame-by-frame pipeline; it trades some speed
- * for simplicity and reliability.
  */
 class VideoProcessor(private val context: Context) {
 
@@ -53,14 +51,14 @@ class VideoProcessor(private val context: Context) {
             onProgress("Extracting frames...", 0.05f)
             // 15 fps and max 720px wide keeps this feasible on a phone.
             val fps = 15
-            val extractCmd = "-y -i \"${inputVideoFile.absolutePath}\" -vf \"fps=$fps,scale=720:-2\" \"${framesDir.absolutePath}/frame_%05d.png\""
+            val extractCmd = "-y -i \"${inputVideoFile.absolutePath}\" -vf \"fps=$fps,scale=720:-2\" -c:v mjpeg -q:v 2 \"${framesDir.absolutePath}/frame_%05d.jpg\""
             val extractSession = FFmpegKit.execute(extractCmd)
             if (!ReturnCode.isSuccess(extractSession.returnCode)) {
                 onProgress("Frame extraction failed: ${logTail(extractSession.allLogsAsString)}", 0f)
                 return@withContext null
             }
 
-            val frameFiles = framesDir.listFiles { f -> f.extension == "png" }?.sortedBy { it.name } ?: emptyList()
+            val frameFiles = framesDir.listFiles { f -> f.extension == "jpg" }?.sortedBy { it.name } ?: emptyList()
             if (frameFiles.isEmpty()) {
                 onProgress("No frames extracted", 0f)
                 return@withContext null
@@ -89,7 +87,7 @@ class VideoProcessor(private val context: Context) {
                     val finalBmp = swapped ?: bmp
                     val outFile = File(outFramesDir, frameFile.name)
                     outFile.outputStream().use { out ->
-                        finalBmp.compress(Bitmap.CompressFormat.PNG, 100, out)
+                        finalBmp.compress(Bitmap.CompressFormat.JPEG, 95, out)
                     }
                 }
                 val frac = 0.1f + 0.8f * (index + 1).toFloat() / total.toFloat()
@@ -99,7 +97,7 @@ class VideoProcessor(private val context: Context) {
             onProgress("Re-encoding video...", 0.92f)
             val outputFile = File(workDir, "output.mp4")
             // mpeg4 is built into FFmpeg (libx264 is NOT in this FFmpegKit package).
-            val encodeCmd = "-y -framerate $fps -i \"${outFramesDir.absolutePath}/frame_%05d.png\" -i \"${inputVideoFile.absolutePath}\" -map 0:v -map 1:a? -c:v mpeg4 -q:v 3 -pix_fmt yuv420p -c:a aac -shortest \"${outputFile.absolutePath}\""
+            val encodeCmd = "-y -framerate $fps -i \"${outFramesDir.absolutePath}/frame_%05d.jpg\" -i \"${inputVideoFile.absolutePath}\" -map 0:v -map 1:a? -c:v mpeg4 -q:v 3 -pix_fmt yuv420p -c:a copy -shortest \"${outputFile.absolutePath}\""
             val encodeSession = FFmpegKit.execute(encodeCmd)
             if (!ReturnCode.isSuccess(encodeSession.returnCode)) {
                 onProgress("Video encoding failed: ${logTail(encodeSession.allLogsAsString)}", 0f)
@@ -117,7 +115,7 @@ class VideoProcessor(private val context: Context) {
 
     private fun logTail(logs: String?): String {
         if (logs.isNullOrBlank()) return ""
-        return logs.trim().takeLast(200)
+        return logs.trim().takeLast(300)
     }
 
     private fun saveToGallery(file: File): Boolean {
